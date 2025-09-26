@@ -1,17 +1,33 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 import cv2
-from flask_cors import CORS 
 import numpy as np
 import re
 import easyocr
 
-similar_map = {
-    "0": "O",
-    "1": "I",
-    "4": "A",
-    "8": "B",
-    "5": "S"
-}
+DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/plat_detection_db"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class Kendaraan(Base):
+    __tablename__ = "kendaraan"
+
+    id = Column(Integer, primary_key=True, index=True)
+    nama_pemilik = Column(String, nullable=False)
+    no_mesin = Column(String, nullable=False)
+    no_rangka = Column(String, nullable=False)
+    no_plat = Column(String, unique=True, nullable=False)
+    jenis_kendaraan = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+
+Base.metadata.create_all(bind=engine)
+
+similar_map = {"0": "O", "1": "I", "4": "A", "8": "B", "5": "S"}
 
 def correct_similar(text, only_letters=False):
     if only_letters:
@@ -38,7 +54,7 @@ def extract_plate_from_parts(parts):
     for i in range(len(parts)):
         for j in range(len(parts)):
             for k in range(len(parts)):
-                if len({i,j,k}) < 3:
+                if len({i, j, k}) < 3:
                     continue
                 pa, pb, pc = parts[i], parts[j], parts[k]
                 if re.fullmatch(r"[A-Z]{1,2}", pa) and re.fullmatch(r"\d{3,4}", pb) and re.fullmatch(r"[A-Z]{1,3}", pc):
@@ -57,14 +73,12 @@ reader = easyocr.Reader(['en'])
 
 def ocr_plate(img):
     result = reader.readtext(img, allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ")
-
     parts = clean_and_order(result)
     plate = extract_plate_from_parts(parts)
-
     return plate, result
 
 app = Flask(__name__)
-CORS(app) 
+CORS(app)
 
 @app.route("/detect", methods=["POST"])
 def api_ocr_plate():
@@ -83,11 +97,33 @@ def api_ocr_plate():
     pre_img = preprocess(img)
     plate, raw_result = ocr_plate(pre_img)
 
+    if not plate:
+        return jsonify({"error": "Plat tidak terbaca", "raw": [
+            {"text": t, "prob": float(p)} for (_, t, p) in raw_result
+        ]})
+
+    db = SessionLocal()
+    kendaraan = db.query(Kendaraan).filter(Kendaraan.no_plat == plate).first()
+    db.close()
+
+    if kendaraan:
+        data_kendaraan = {
+            "nama_pemilik": kendaraan.nama_pemilik,
+            "no_mesin": kendaraan.no_mesin,
+            "no_rangka": kendaraan.no_rangka,
+            "no_plat": kendaraan.no_plat,
+            "jenis_kendaraan": kendaraan.jenis_kendaraan,
+            "status": kendaraan.status
+        }
+    else:
+        data_kendaraan = {
+            "message": "Kendaraan Tidak Terdaftar"
+        }
+
     return jsonify({
         "plate": plate,
-        "raw": [
-            {"text": t, "prob": float(p)} for (_, t, p) in raw_result
-        ]
+        "raw": [{"text": t, "prob": float(p)} for (_, t, p) in raw_result],
+        "match": data_kendaraan
     })
 
 if __name__ == "__main__":
