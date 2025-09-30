@@ -1,3 +1,6 @@
+import signal
+import sys
+import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, Integer, String
@@ -7,23 +10,48 @@ import cv2
 import numpy as np
 import re
 import easyocr
+import threading
+from dotenv import load_dotenv
+from datetime import datetime
+from flask_admin import Admin
+from flask_admin.contrib.sqla import ModelView
+from sqlalchemy.orm import scoped_session, sessionmaker
 
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/plat_detection_db"
+load_dotenv()
+
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME")
+
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+FLASK_HOST = os.getenv("FLASK_HOST", "0,0,0,0")
+FLASK_PORT = int(os.getenv("FLASK_PORT", 5000))
+FLASK_DEBUG =os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1")
 
 engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Session = scoped_session(session_factory)
 Base = declarative_base()
 
 class Kendaraan(Base):
     __tablename__ = "kendaraan"
-
     id = Column(Integer, primary_key=True, index=True)
-    nama_pemilik = Column(String, nullable=False)
-    no_mesin = Column(String, nullable=False)
-    no_rangka = Column(String, nullable=False)
-    no_plat = Column(String, unique=True, nullable=False)
-    jenis_kendaraan = Column(String, nullable=False)
-    status = Column(String, nullable=False)
+    nama_pemilik = Column(String(15), nullable=False)
+    no_mesin = Column(String(10), nullable=False)
+    no_rangka = Column(String(15), nullable=False)
+    no_plat = Column(String(10), unique=True, nullable=False)
+    jenis_kendaraan = Column(String(20), nullable=False)
+    status = Column(String(20), nullable=False)
+
+class ScanLog(Base):
+    __tablename__ = "scan_log"
+    id = Column(Integer, primary_key=True, index=True)
+    plate_text = Column(String(15), nullable=False)
+    is_match = Column(String(20), nullable=False)
+    created_at = Column(String(50), nullable=False)
 
 Base.metadata.create_all(bind=engine)
 
@@ -69,7 +97,7 @@ def extract_plate_from_parts(parts):
         return f"{huruf_awal} {angka} {huruf_akhir}"
     return None
 
-reader = easyocr.Reader(['en'])
+reader = easyocr.Reader(['en'], gpu=False)
 
 def ocr_plate(img):
     result = reader.readtext(img, allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ")
@@ -77,8 +105,30 @@ def ocr_plate(img):
     plate = extract_plate_from_parts(parts)
     return plate, result
 
+def graceful_exit(signum, frame):
+    print("\n[INFO] Received shutdown signal. Cleaning up...")
+    try:
+        reader.close()  
+    except Exception:
+        pass
+    try:
+        engine.dispose()  
+    except Exception:
+        pass
+    print("[INFO] Shutdown complete.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, graceful_exit)
+signal.signal(signal.SIGTERM, graceful_exit)
+
 app = Flask(__name__)
+app.config["SECRET_KEY"] = os.getenv('SECRET_KEY')
 CORS(app)
+
+admin = Admin(app, name="Admin", template_mode="bootstrap4")
+
+admin.add_view(ModelView(Kendaraan, Session()))
+admin.add_view(ModelView(ScanLog, Session()))
 
 @app.route("/detect", methods=["POST"])
 def api_ocr_plate():
@@ -98,13 +148,22 @@ def api_ocr_plate():
     plate, raw_result = ocr_plate(pre_img)
 
     if not plate:
+        db = Session()
+        log = ScanLog(
+            plate_text=None,
+            is_match="Tidak Terdaftar",
+            created_at=str(np.datetime64('now'))
+        )
+        db.add(log)
+        db.commit()
+        db.close()
+
         return jsonify({"error": "Plat tidak terbaca", "raw": [
             {"text": t, "prob": float(p)} for (_, t, p) in raw_result
         ]})
 
-    db = SessionLocal()
+    db = Session()
     kendaraan = db.query(Kendaraan).filter(Kendaraan.no_plat == plate).first()
-    db.close()
 
     if kendaraan:
         data_kendaraan = {
@@ -115,16 +174,56 @@ def api_ocr_plate():
             "jenis_kendaraan": kendaraan.jenis_kendaraan,
             "status": kendaraan.status
         }
+        is_match = "Terdaftar"
     else:
-        data_kendaraan = {
-            "message": "Kendaraan Tidak Terdaftar"
-        }
+        data_kendaraan = {"message": "Kendaraan Tidak Terdaftar"}
+        is_match = "Tidak Terdaftar"
+    
+    log = ScanLog(
+        plate_text=plate,
+        is_match=is_match,
+        created_at=str(np.datetime64('now'))
+    )
+    db.add(log)
+    db.commit()
+    db.close()
 
     return jsonify({
         "plate": plate,
         "raw": [{"text": t, "prob": float(p)} for (_, t, p) in raw_result],
         "match": data_kendaraan
     })
+@app.route("/scans", methods=["GET"])
+def get_scans():
+    db = Session()
+    scans = db.query(ScanLog).all()
+    db.close()
+    return jsonify([
+        {
+            "id": s.id,
+            "plate_text": s.plate_text,
+            "is_match": s.is_match,
+            "created_at": s.created_at
+        }
+        for s in scans
+    ])
+
+@app.route("/scans/<int:scan_id>/verify", methods=["POST"])
+def verify_scan(scan_id):
+    data = request.get_json()
+    status = data.get("status")
+
+    db = Session()
+    scan = db.query(ScanLog).filter(ScanLog.id == scan_id).first()
+    if not scan:
+        db.close()
+        return jsonify({"error": "Scan not Found"}), 404
+
+    scan.is_match = status
+    db.commit()
+    db.close()
+    return jsonify({"message": "Scan updated", "id": scan_id, "status": status})
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    print("[INFO] Starting server...")
+    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=FLASK_DEBUG, threaded=True)
