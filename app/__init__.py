@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from .config import Config
 from .db import init_db, get_scoped_session
 from .models import Base, Kendaraan, ScanLog
+from .extensions import init_extensions
 from flask_admin import Admin
 from flask_admin.contrib.sqla import ModelView
 
@@ -31,6 +32,8 @@ def create_app() -> Flask:
     app.extensions = getattr(app, "extensions", {})
     app.extensions["engine"] = engine
     app.extensions["Session"] = Session
+
+    init_extensions(app)
 
     admin = Admin(app, name="Admin", template_mode="bootstrap4")
     admin.add_view(ModelView(Kendaraan, Session()))
