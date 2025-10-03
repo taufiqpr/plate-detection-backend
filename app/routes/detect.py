@@ -1,14 +1,18 @@
 from flask import Blueprint, current_app, jsonify, request
+from datetime import datetime
+import pytz
 import numpy as np
 import cv2
 
 from ..db import get_scoped_session
+from ..utils.time import now_wib
 from ..models import Kendaraan, ScanLog
 from ..services.ocr import preprocess, ocr_plate
 
 
 bp = Blueprint("detect", __name__)
 
+WIB = pytz.timezone("Asia/Jakarta")
 
 @bp.route("/detect", methods=["POST"])
 def api_ocr_plate():
@@ -34,7 +38,7 @@ def api_ocr_plate():
         log = ScanLog(
             plate_text=None,
             is_match="Tidak Terdaftar",
-            created_at=str(np.datetime64('now'))
+            created_at=now_wib()
         )
         db.add(log)
         db.commit()
@@ -64,7 +68,7 @@ def api_ocr_plate():
     log = ScanLog(
         plate_text=plate,
         is_match=is_match,
-        created_at=str(np.datetime64('now'))
+        created_at=now_wib()
     )
     db.add(log)
     db.commit()
